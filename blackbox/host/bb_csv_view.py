@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""View saved bb_live CSV files with multi-panel zoom controls.
+
+Usage:
+  python bb_csv_view.py blackbox/host/bb_live_20260612_120355.csv
+  python bb_csv_view.py        # open empty, then pick a file with "打开 CSV…"
+
+The window starts without requiring a file; use the "打开 CSV…" button to
+load or switch CSV files at any time without restarting from the command line.
+"""
+
+import argparse
+import bisect
+import csv
+import math
+import os
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+import matplotlib as mpl
+
+mpl.rcParams["path.simplify"] = True
+mpl.rcParams["path.simplify_threshold"] = 1.0
+mpl.rcParams["agg.path.chunksize"] = 10000
+mpl.rcParams["axes.unicode_minus"] = False
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+from matplotlib.widgets import RectangleSelector
+
+
+# Panels whose columns are absent in the loaded CSV are dropped automatically,
+# so this default works for both the live stream (erpm/id/iq/ud/uq/theta_obs)
+# and the full 'd' dump (which still carries extra FOC fields).
+DEFAULT_PANELS = [
+    {"title": "ERPM", "cols": ["erpm"]},
+    {"title": "dq currents", "cols": ["id", "iq"]},
+    {"title": "dq voltages", "cols": ["ud", "uq", "vd", "vq"]},
+    {"title": "Observer angle", "cols": ["theta_obs", "phase_obs"]},
+    {"title": "Phase currents", "cols": ["ia", "ib", "ic"]},
+    {"title": "Electrical angle", "cols": ["theta", "theta_enc", "theta_used", "phase", "phase_enc", "theta_obs", "phase_obs"]},
+    {"title": "Duty", "cols": ["duty"]},
+    {"title": "Fault", "cols": ["fault"]},
+]
+
+
+def get_unit(col):
+    if col in ("ia", "ib", "ic", "id", "iq", "i_abs", "i_abs_filter"):
+        return "A"
+    if col == "duty":
+        return ""
+    if col == "fault":
+        return "code"
+    if col in ("v_bus", "ud", "uq", "vd", "vq"):
+        return "V"
+    if col == "erpm":
+        return "ERPM"
+    if col in ("theta", "theta_enc", "theta_obs", "theta_used", "phase", "phase_enc", "phase_obs"):
+        return "rad"
+    return ""
+
+
+class CsvData:
+    def __init__(self, path):
+        self.path = path
+        self.columns = []
+        self.data = {}
+        # Units for derived (computed) columns; overrides get_unit() by name.
+        self.units = {}
+        self.load(path)
+
+    def unique_col_name(self, base):
+        name = base
+        i = 2
+        while name in self.data:
+            name = f"{base}#{i}"
+            i += 1
+        return name
+
+    def add_derived(self, name, values, unit=""):
+        self.data[name] = values
+        if name not in self.plot_columns:
+            self.plot_columns.append(name)
+        if unit:
+            self.units[name] = unit
+
+    def load(self, path):
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            self.columns = [c for c in (reader.fieldnames or []) if c]
+            for col in self.columns:
+                self.data[col] = []
+            for row in reader:
+                for col in self.columns:
+                    try:
+                        self.data[col].append(float(row[col]))
+                    except (ValueError, TypeError, KeyError):
+                        self.data[col].append(float("nan"))
+
+        if "t_s" not in self.data:
+            raise ValueError("CSV does not contain t_s")
+
+        self.plot_columns = [c for c in self.columns if c not in ("wall_time_s", "t_s", "tick")]
+
+    def x(self):
+        return self.data["t_s"]
+
+    def y(self, col):
+        return self.data[col]
+
+
+class CsvScopeApp:
+    def __init__(self, root, data=None):
+        self.root = root
+        self.root.title("Blackbox CSV Viewer")
+        self.root.geometry("1450x900")
+
+        self.data = None
+        self.panels = []
+        self.current_panel = 0
+        self.axes = []
+        self.lines = {}
+        self.selectors = []
+        self.box_zoom_mode = None
+        self.wheel_mode = tk.StringVar(value="XY")
+        self.status_text = tk.StringVar(value="未加载数据，请点击“打开 CSV…”")
+
+        # Vertical cursor placed by a left click, snapped to the nearest sample.
+        self.cursor_x = None
+        self.cursor_lines = []
+
+        self.build_ui()
+
+        if data is not None:
+            self.apply_data(data)
+        else:
+            self.rebuild_figure(keep_xlim=False)
+
+    def apply_data(self, data):
+        self.data = data
+        self.root.title(f"Blackbox CSV Viewer - {os.path.basename(data.path)}")
+        self.path_label.config(text=os.path.basename(data.path))
+
+        self.panels = []
+        for panel in DEFAULT_PANELS:
+            cols = [c for c in panel["cols"] if c in data.plot_columns]
+            if cols:
+                self.panels.append({"title": panel["title"], "cols": cols})
+        if not self.panels:
+            self.panels.append({"title": "Panel 1", "cols": data.plot_columns[:3]})
+
+        self.current_panel = 0
+        self.status_text.set(f"{len(data.x())} rows")
+        self.rebuild_figure(keep_xlim=False)
+
+    def open_csv(self):
+        path = filedialog.askopenfilename(
+            title="选择 bb_live CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            data = CsvData(path)
+        except Exception as e:
+            messagebox.showerror("加载失败", str(e))
+            return
+        self.apply_data(data)
+
+    def build_ui(self):
+        main = ttk.Frame(self.root)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        left = ttk.Frame(main, width=285)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=8, pady=8)
+        left.pack_propagate(False)
+
+        right = ttk.Frame(main)
+        right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+
+        ttk.Label(left, text="Blackbox CSV Viewer", font=("", 12, "bold")).pack(anchor="w")
+        self.path_label = ttk.Label(left, text="（未加载）", wraplength=260)
+        self.path_label.pack(anchor="w", pady=(2, 8))
+
+        ttk.Button(left, text="打开 CSV…", command=self.open_csv).pack(fill=tk.X)
+        ttk.Button(left, text="重置视图", command=self.reset_view).pack(fill=tk.X, pady=(4, 0))
+        ttk.Button(left, text="当前 X 范围内自动缩放 Y", command=self.autoscale_all_y_to_visible_x).pack(fill=tk.X, pady=(4, 0))
+
+        ttk.Separator(left).pack(fill=tk.X, pady=10)
+        ttk.Label(left, text="子图列表").pack(anchor="w")
+        self.panel_list = tk.Listbox(left, height=7, exportselection=False)
+        self.panel_list.pack(fill=tk.X, pady=(2, 6))
+        self.panel_list.bind("<<ListboxSelect>>", self.on_panel_select)
+
+        row = ttk.Frame(left)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Button(row, text="新增子图", command=self.add_panel_dialog).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+        ttk.Button(row, text="编辑子图", command=self.edit_panel_dialog).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
+        ttk.Button(left, text="删除子图", command=self.delete_panel).pack(fill=tk.X, pady=(2, 0))
+        ttk.Button(left, text="新增差值子图", command=self.add_diff_panel_dialog).pack(fill=tk.X, pady=(2, 0))
+
+        ttk.Separator(left).pack(fill=tk.X, pady=10)
+        ttk.Label(left, text="滚轮缩放模式").pack(anchor="w")
+        ttk.Combobox(left, textvariable=self.wheel_mode, values=["XY", "X", "Y"], state="readonly").pack(fill=tk.X)
+        ttk.Label(
+            left,
+            text="靠近 X 轴滚轮只缩放 X；靠近 Y 轴只缩放 Y；图内按上方模式缩放。",
+            wraplength=260,
+        ).pack(anchor="w", pady=(4, 0))
+
+        ttk.Separator(left).pack(fill=tk.X, pady=10)
+        ttk.Label(left, text="框选缩放").pack(anchor="w")
+        row = ttk.Frame(left)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Button(row, text="XY", command=lambda: self.set_box_zoom("XY")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 2))
+        ttk.Button(row, text="X", command=lambda: self.set_box_zoom("X")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+        ttk.Button(row, text="Y", command=lambda: self.set_box_zoom("Y")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(2, 0))
+        ttk.Button(left, text="关闭框选", command=lambda: self.set_box_zoom(None)).pack(fill=tk.X, pady=(2, 0))
+
+        ttk.Separator(left).pack(fill=tk.X, pady=10)
+        ttk.Label(left, textvariable=self.status_text, wraplength=260).pack(anchor="w")
+
+        self.fig = Figure(figsize=(12, 8), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=right)
+        self.toolbar = NavigationToolbar2Tk(self.canvas, right, pack_toolbar=False)
+        self.toolbar.update()
+        self.toolbar.pack(side=tk.TOP, fill=tk.X)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self.canvas.mpl_connect("scroll_event", self.on_scroll)
+        self.canvas.mpl_connect("button_press_event", self.on_button_press)
+
+    def choose_columns_dialog(self, title, initial=None):
+        initial = set(initial or [])
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("360x500")
+        win.transient(self.root)
+        win.grab_set()
+
+        result = {"cols": None}
+        lb = tk.Listbox(win, selectmode=tk.EXTENDED, exportselection=False)
+        lb.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        for col in self.data.plot_columns:
+            lb.insert(tk.END, col)
+            if col in initial:
+                lb.selection_set(tk.END)
+
+        btns = ttk.Frame(win)
+        btns.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        def ok():
+            cols = [self.data.plot_columns[i] for i in lb.curselection()]
+            if not cols:
+                messagebox.showwarning("未选择变量", "至少选择一个变量。", parent=win)
+                return
+            result["cols"] = cols
+            win.destroy()
+
+        ttk.Button(btns, text="确定", command=ok).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side=tk.RIGHT)
+        self.root.wait_window(win)
+        return result["cols"]
+
+    def add_panel_dialog(self):
+        if self.data is None:
+            return
+        cols = self.choose_columns_dialog("新增子图")
+        if cols:
+            self.panels.append({"title": f"Panel {len(self.panels) + 1}", "cols": cols})
+            self.current_panel = len(self.panels) - 1
+            self.rebuild_figure(keep_xlim=True)
+
+    def col_unit(self, col):
+        if self.data is not None and col in self.data.units:
+            return self.data.units[col]
+        return get_unit(col)
+
+    def add_diff_panel_dialog(self):
+        if self.data is None or not self.data.plot_columns:
+            return
+        cols = list(self.data.plot_columns)
+
+        win = tk.Toplevel(self.root)
+        win.title("新增差值子图")
+        win.geometry("340x230")
+        win.transient(self.root)
+        win.grab_set()
+
+        ttk.Label(win, text="被减数 A").pack(anchor="w", padx=10, pady=(10, 2))
+        var_a = tk.StringVar(value=cols[0])
+        ttk.Combobox(win, textvariable=var_a, values=cols, state="readonly").pack(fill=tk.X, padx=10)
+
+        ttk.Label(win, text="减数 B").pack(anchor="w", padx=10, pady=(8, 2))
+        var_b = tk.StringVar(value=cols[1] if len(cols) > 1 else cols[0])
+        ttk.Combobox(win, textvariable=var_b, values=cols, state="readonly").pack(fill=tk.X, padx=10)
+
+        wrap_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(win, text="按角度归一化差值到 -π..π", variable=wrap_var).pack(anchor="w", padx=10, pady=(10, 0))
+
+        def sync_wrap(*_):
+            wrap_var.set(self.col_unit(var_a.get()) == "rad" and self.col_unit(var_b.get()) == "rad")
+
+        var_a.trace_add("write", sync_wrap)
+        var_b.trace_add("write", sync_wrap)
+        sync_wrap()
+
+        btns = ttk.Frame(win)
+        btns.pack(fill=tk.X, padx=10, pady=12)
+
+        def ok():
+            a, b = var_a.get(), var_b.get()
+            ya, yb = self.data.y(a), self.data.y(b)
+            n = min(len(ya), len(yb))
+            wrap = wrap_var.get()
+            out = []
+            for i in range(n):
+                d = ya[i] - yb[i]
+                if wrap:
+                    d = math.remainder(d, 2.0 * math.pi)
+                out.append(d)
+            unit = self.col_unit(a) if self.col_unit(a) == self.col_unit(b) else ""
+            name = self.data.unique_col_name(f"{a}-{b}")
+            self.data.add_derived(name, out, unit)
+            self.panels.append({"title": name, "cols": [name]})
+            self.current_panel = len(self.panels) - 1
+            self.rebuild_figure(keep_xlim=True)
+            win.destroy()
+
+        ttk.Button(btns, text="确定", command=ok).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side=tk.RIGHT)
+        self.root.wait_window(win)
+
+    def edit_panel_dialog(self):
+        if self.data is None or not self.panels:
+            return
+        cols = self.choose_columns_dialog("编辑子图", self.panels[self.current_panel]["cols"])
+        if cols:
+            self.panels[self.current_panel]["cols"] = cols
+            self.rebuild_figure(keep_xlim=True)
+
+    def delete_panel(self):
+        if len(self.panels) <= 1:
+            return
+        del self.panels[self.current_panel]
+        self.current_panel = max(0, min(self.current_panel, len(self.panels) - 1))
+        self.rebuild_figure(keep_xlim=True)
+
+    def on_panel_select(self, _event=None):
+        sel = self.panel_list.curselection()
+        if sel:
+            self.current_panel = int(sel[0])
+
+    def refresh_panel_list(self):
+        self.panel_list.delete(0, tk.END)
+        for i, panel in enumerate(self.panels):
+            self.panel_list.insert(tk.END, f"{i + 1}: {', '.join(panel['cols'])}")
+        if self.panels:
+            self.panel_list.selection_set(self.current_panel)
+
+    def rebuild_figure(self, keep_xlim=True):
+        old_xlim = self.axes[0].get_xlim() if keep_xlim and self.axes else None
+        self.fig.clear()
+        self.axes = []
+        self.lines = {}
+        # The cleared figure dropped any previous cursor artists.
+        self.cursor_lines = []
+
+        n = len(self.panels)
+        first_ax = None
+        for i, panel in enumerate(self.panels):
+            ax = self.fig.add_subplot(n, 1, i + 1, sharex=first_ax)
+            if first_ax is None:
+                first_ax = ax
+            self.axes.append(ax)
+            for col in panel["cols"]:
+                line, = ax.plot(self.data.x(), self.data.y(col), lw=1.0, label=col)
+                self.lines[(i, col)] = line
+            ax.grid(True, linestyle="--", alpha=0.3)
+            ax.set_ylabel(self.panel_ylabel(panel["cols"]))
+            ax.set_title(panel["title"], loc="left", fontsize=10)
+            ax.legend(loc="upper right", fontsize=8)
+
+        if self.axes:
+            self.axes[-1].set_xlabel("time / s")
+            if old_xlim:
+                self.axes[0].set_xlim(old_xlim)
+            else:
+                xs = self.data.x()
+                self.axes[0].set_xlim(xs[0], xs[-1] if xs[-1] > xs[0] else xs[0] + 1.0)
+
+        if self.axes:
+            self.fig.tight_layout(rect=[0, 0, 1, 0.97])
+        self.refresh_panel_list()
+        self.create_selectors()
+        self.autoscale_all_y_to_visible_x(redraw=False)
+        if self.cursor_x is not None:
+            self.draw_cursor(redraw=False)
+        self.canvas.draw_idle()
+
+    def panel_ylabel(self, cols):
+        units = {self.col_unit(c) for c in cols if self.col_unit(c)}
+        return "/".join(sorted(units)) if units else "value"
+
+    def autoscale_all_y_to_visible_x(self, redraw=True):
+        if not self.axes:
+            return
+        xs = self.data.x()
+        if not xs:
+            return
+        x0, x1 = self.axes[0].get_xlim()
+        if x0 > x1:
+            x0, x1 = x1, x0
+        i0 = max(0, bisect.bisect_left(xs, x0) - 1)
+        i1 = min(len(xs), bisect.bisect_right(xs, x1) + 1)
+        if i1 <= i0:
+            i0, i1 = 0, len(xs)
+
+        for panel_idx, ax in enumerate(self.axes):
+            ys_all = []
+            for col in self.panels[panel_idx]["cols"]:
+                ys_all.extend(y for y in self.data.y(col)[i0:i1] if y == y)
+            if not ys_all:
+                continue
+            y_min = min(ys_all)
+            y_max = max(ys_all)
+            pad = (y_max - y_min) * 0.08 if y_max != y_min else (abs(y_min) * 0.1 or 1.0)
+            ax.set_ylim(y_min - pad, y_max + pad)
+        if redraw:
+            self.canvas.draw_idle()
+
+    def reset_view(self):
+        if self.data is None:
+            return
+        xs = self.data.x()
+        if xs and self.axes:
+            self.axes[0].set_xlim(xs[0], xs[-1] if xs[-1] > xs[0] else xs[0] + 1.0)
+            self.autoscale_all_y_to_visible_x(redraw=False)
+        self.canvas.draw_idle()
+
+    def create_selectors(self):
+        for selector in self.selectors:
+            selector.set_active(False)
+        self.selectors = []
+        for ax in self.axes:
+            selector = RectangleSelector(
+                ax, self.on_box_select, useblit=True, button=[1],
+                minspanx=5, minspany=5, spancoords="pixels", interactive=False,
+            )
+            selector.set_active(self.box_zoom_mode is not None)
+            self.selectors.append(selector)
+
+    def set_box_zoom(self, mode):
+        self.box_zoom_mode = mode
+        for selector in self.selectors:
+            selector.set_active(mode is not None)
+        self.status_text.set(f"框选缩放: {mode}" if mode else "框选缩放关闭")
+
+    def on_box_select(self, eclick, erelease):
+        if self.box_zoom_mode is None or eclick.inaxes != erelease.inaxes:
+            return
+        ax = eclick.inaxes
+        mode = self.box_zoom_mode.upper()
+        if mode in ("X", "XY") and eclick.xdata is not None and erelease.xdata is not None:
+            x0, x1 = sorted([eclick.xdata, erelease.xdata])
+            if abs(x1 - x0) > 1e-12:
+                self.axes[0].set_xlim(x0, x1)
+        if mode in ("Y", "XY") and eclick.ydata is not None and erelease.ydata is not None:
+            y0, y1 = sorted([eclick.ydata, erelease.ydata])
+            if abs(y1 - y0) > 1e-12:
+                ax.set_ylim(y0, y1)
+        if mode == "X":
+            self.autoscale_all_y_to_visible_x(redraw=False)
+        self.canvas.draw_idle()
+
+    def on_button_press(self, event):
+        # Left click places a snapped vertical cursor across all subplots.
+        # Skip while box-zoom or the toolbar pan/zoom tools own the left button.
+        if event.button != 1 or self.data is None or not self.axes:
+            return
+        if self.box_zoom_mode is not None:
+            return
+        if getattr(self.toolbar, "mode", ""):
+            return
+        if event.inaxes not in self.axes or event.xdata is None:
+            return
+        panel_idx = self.axes.index(event.inaxes)
+        self.set_cursor(event.xdata, panel_idx)
+
+    def set_cursor(self, x, panel_idx=None):
+        xs = self.data.x()
+        if not xs:
+            return
+        idx = self.nearest_index(xs, x)
+        self.cursor_x = xs[idx]
+        self.draw_cursor()
+        self.update_cursor_status(idx, panel_idx if panel_idx is not None else self.current_panel)
+
+    @staticmethod
+    def nearest_index(xs, x):
+        i = bisect.bisect_left(xs, x)
+        if i <= 0:
+            return 0
+        if i >= len(xs):
+            return len(xs) - 1
+        return i if (xs[i] - x) < (x - xs[i - 1]) else i - 1
+
+    def clear_cursor_lines(self):
+        for line in self.cursor_lines:
+            try:
+                line.remove()
+            except (ValueError, NotImplementedError):
+                pass
+        self.cursor_lines = []
+
+    def draw_cursor(self, redraw=True):
+        self.clear_cursor_lines()
+        if self.cursor_x is None:
+            return
+        for ax in self.axes:
+            line = ax.axvline(self.cursor_x, color="0.35", linestyle="--", linewidth=0.9, zorder=5)
+            self.cursor_lines.append(line)
+        if redraw:
+            self.canvas.draw_idle()
+
+    def update_cursor_status(self, idx, panel_idx):
+        parts = [f"t={self.data.x()[idx]:.6f}s"]
+        if "tick" in self.data.data:
+            parts.append(f"tick={int(self.data.data['tick'][idx])}")
+        for col in self.panels[panel_idx]["cols"]:
+            parts.append(f"{col}={self.data.y(col)[idx]:.3f}")
+        self.status_text.set("  ".join(parts))
+
+    def on_scroll(self, event):
+        if not self.axes:
+            return
+        ax = self.axis_from_event(event)
+        if ax is None:
+            return
+
+        mode = self.wheel_mode_from_event(event, ax)
+        scale = 0.8 if event.button == "up" else 1.25
+
+        if mode in ("X", "XY"):
+            center = event.xdata
+            if center is None:
+                center = ax.transData.inverted().transform((event.x, event.y))[0]
+            x0, x1 = self.axes[0].get_xlim()
+            self.axes[0].set_xlim(center - (center - x0) * scale, center + (x1 - center) * scale)
+
+        if mode in ("Y", "XY"):
+            center = event.ydata
+            if center is None:
+                center = ax.transData.inverted().transform((event.x, event.y))[1]
+            y0, y1 = ax.get_ylim()
+            ax.set_ylim(center - (center - y0) * scale, center + (y1 - center) * scale)
+
+        self.canvas.draw_idle()
+
+    def axis_from_event(self, event):
+        if event.inaxes in self.axes:
+            return event.inaxes
+        for ax in self.axes:
+            box = ax.bbox
+            if box.x0 - 70 <= event.x <= box.x1 + 10 and box.y0 - 45 <= event.y <= box.y1 + 10:
+                return ax
+        return None
+
+    def wheel_mode_from_event(self, event, ax):
+        box = ax.bbox
+        if box.x0 <= event.x <= box.x1 and box.y0 - 45 <= event.y <= box.y0 + 8:
+            return "X"
+        if box.x0 - 70 <= event.x <= box.x0 + 8 and box.y0 <= event.y <= box.y1:
+            return "Y"
+        return self.wheel_mode.get().upper()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("csvfile", nargs="?", help="Saved bb_live CSV (optional)")
+    args = parser.parse_args()
+
+    root = tk.Tk()
+    app = CsvScopeApp(root)
+    if args.csvfile:
+        try:
+            app.apply_data(CsvData(args.csvfile))
+        except Exception as e:
+            messagebox.showerror("加载失败", str(e))
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
